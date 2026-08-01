@@ -1,7 +1,7 @@
 """Konfiguration aus Umgebungsvariablen.
 
-Alle Werte haben Defaults, die auf Schimmis Setup passen — der Server laeuft
-also ohne Konfiguration, laesst sich aber vollstaendig umstellen.
+Alle Werte haben neutrale Defaults; der Server laeuft ohne Konfiguration gegen
+einen lokalen Broker und laesst sich vollstaendig ueber Env-Variablen umstellen.
 """
 from __future__ import annotations
 
@@ -42,7 +42,7 @@ DEFAULT_GESPERRT = [
 
 @dataclass
 class Config:
-    host: str = field(default_factory=lambda: os.environ.get("MQTT_MCP_HOST", "192.168.178.65"))
+    host: str = field(default_factory=lambda: os.environ.get("MQTT_MCP_HOST", "localhost"))
     port: int = field(default_factory=lambda: int(os.environ.get("MQTT_MCP_PORT", "1883")))
     username: str | None = field(default_factory=lambda: os.environ.get("MQTT_MCP_USERNAME") or None)
     password: str | None = field(default_factory=lambda: os.environ.get("MQTT_MCP_PASSWORD") or None)

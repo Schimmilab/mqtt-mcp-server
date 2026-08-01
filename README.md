@@ -61,7 +61,7 @@ are fixed at session start.
 
 | Variable | Default | |
 |---|---|---|
-| `MQTT_MCP_HOST` | `192.168.178.65` | broker host |
+| `MQTT_MCP_HOST` | `localhost` | broker host |
 | `MQTT_MCP_PORT` | `1883` | |
 | `MQTT_MCP_USERNAME` / `_PASSWORD` | — | optional auth |
 | `MQTT_MCP_TOPICS` | `#` | comma-separated subscription filters |
