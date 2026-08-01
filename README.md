@@ -93,6 +93,22 @@ This server stores them, but flags them: `aus_startschwall: true`. `get_last` us
 them (that is how a sleeping sensor still has a value); `get_history` can exclude
 them.
 
+## Known limitations
+
+**Broker authentication is implemented but untested against a real broker.**
+`MQTT_MCP_USERNAME` / `MQTT_MCP_PASSWORD` are passed to `username_pw_set()`, and
+unit tests verify they reach the client — but no authenticating broker was
+available during development. If you use auth, verify it works before relying on it.
+
+**Two behaviours are only covered by unit tests, not by integration tests:**
+connection loss (`get_gaps`) and devices going quiet (`find_silent`). Both are hard
+to trigger on demand without a controllable broker. A built-in traffic simulator is
+the obvious fix and is planned.
+
+**History only covers times when the server was running.** It is a debugging tool
+started on demand, not a 24/7 collector. If something breaks while you are away and
+no session is open, nothing is recorded.
+
 ## Retention
 
 Runs at startup and hourly: delete older than N days, then — if still over the size

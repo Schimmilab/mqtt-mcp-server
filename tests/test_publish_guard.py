@@ -106,3 +106,39 @@ def test_on_connect_abonniert_nicht_bei_fehler(tmp_path):
     c._on_connect(FakeClient(), None, None, _FakeReasonCode(True))
     assert gerufen == []
     assert c.ist_verbunden is False
+
+
+# --- Authentifizierung -------------------------------------------------------
+# Der Broker im Heimnetz laeuft ohne Auth, der Pfad ist also nie am Ist gelaufen.
+# Diese Tests belegen nur, dass die Zugangsdaten am paho-Client ankommen —
+# NICHT, dass eine echte Anmeldung funktioniert. Das bleibt offen.
+
+def test_zugangsdaten_werden_an_den_client_gereicht(tmp_path, monkeypatch):
+    gesetzt = {}
+    import paho.mqtt.client as mqtt
+    original = mqtt.Client.username_pw_set
+    def fake(self, u, p=None):
+        gesetzt["user"], gesetzt["pass"] = u, p
+        return original(self, u, p)
+    monkeypatch.setattr(mqtt.Client, "username_pw_set", fake)
+    _collector(tmp_path, username="alice", password="geheim")
+    assert gesetzt == {"user": "alice", "pass": "geheim"}
+
+
+def test_ohne_username_wird_nichts_gesetzt(tmp_path, monkeypatch):
+    gerufen = []
+    import paho.mqtt.client as mqtt
+    monkeypatch.setattr(mqtt.Client, "username_pw_set",
+                        lambda self, u, p=None: gerufen.append(u))
+    _collector(tmp_path)
+    assert gerufen == []
+
+
+def test_username_ohne_passwort_ist_zulaessig(tmp_path, monkeypatch):
+    """Manche Broker authentifizieren nur ueber den Benutzernamen."""
+    gesetzt = {}
+    import paho.mqtt.client as mqtt
+    monkeypatch.setattr(mqtt.Client, "username_pw_set",
+                        lambda self, u, p=None: gesetzt.update(user=u, pw=p))
+    _collector(tmp_path, username="nurname")
+    assert gesetzt == {"user": "nurname", "pw": None}
