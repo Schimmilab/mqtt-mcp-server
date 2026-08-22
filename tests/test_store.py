@@ -120,3 +120,36 @@ def test_grosse_payloads_werden_gekuerzt_aber_gemeldet(store):
 def test_binaerdaten_brechen_nicht(store):
     store.add_message("bin", b"\xff\xfe\x00", 0, False, False)
     assert store.get_last("bin")["wert"] is not None
+
+
+def test_pattern_findet_auch_alte_topics(store):
+    """⛔ Regression 2026-08-22: Das Pattern lief FRUEHER hinter dem LIMIT.
+
+    Die Datenbank lieferte die N zuletzt aktiven Topics, `fnmatch` filterte
+    erst danach — ein aelteres Topic war damit unauffindbar, und die Antwort
+    war ein sauberes `0 Topics` statt eines Fehlers. Genau die gefaehrliche
+    Sorte: das Ergebnis liest sich als Befund ("gibt es nicht").
+
+    Real gefunden beim Bau der Ownership-Karte fuer den IPS-Parallelbetrieb:
+    `list_topics(pattern="display/*", limit=30)` meldete 0, waehrend es 7 gab.
+    Dort waere der Schaden maximal gewesen — die Ownership-Pruefung fragt nach
+    Topics mit zwei Besitzern, und "keine gefunden" ist genau die Antwort, die
+    man hoeren will. Ein kaputter Filter haette die Freigabe erteilt.
+
+    Der Test baut die Lage nach: EIN gesuchtes, aelteres Topic plus lauter
+    juengere Stoerer, die das Limit fuellen.
+    """
+    store.add_message("gesucht/alt", b"x", 0, False, False, ts=1000.0)
+    for i in range(20):
+        store.add_message(f"laut/neu{i}", b"y", 0, False, False, ts=2000.0 + i)
+
+    # Positivkontrolle: mit engem Limit muss das alte Topic TROTZDEM kommen.
+    assert [t["topic"] for t in store.list_topics(pattern="gesucht/*", limit=5)] \
+        == ["gesucht/alt"]
+
+    # Negativkontrolle: ohne sie waere der Test oben auch dann gruen, wenn der
+    # Filter gar nicht mehr filtert.
+    assert store.list_topics(pattern="gibtesnicht/*", limit=200) == []
+
+    # Und das Limit muss ohne Pattern weiterhin greifen.
+    assert len(store.list_topics(limit=5)) == 5

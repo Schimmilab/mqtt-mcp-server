@@ -14,7 +14,6 @@ lang unsichtbar gemacht.
 """
 from __future__ import annotations
 
-import fnmatch
 import sqlite3
 import threading
 import time
@@ -87,20 +86,41 @@ class Store:
 
     def list_topics(self, pattern: str | None = None, since: float | None = None,
                     limit: int = 500) -> list[dict]:
+        # ⛔ DAS PATTERN GEHOERT INS SQL, NICHT HINTER DAS LIMIT (Fix 2026-08-22).
+        #    Vorher lief `LIMIT ?` im SQL und `fnmatch` DANACH in Python: die
+        #    Datenbank lieferte die N zuletzt aktiven Topics, und erst darauf
+        #    wurde gefiltert. Ein Topic, das nicht unter die juengsten N fiel,
+        #    war unauffindbar — die Antwort war dann ein sauberes `0 Topics`.
+        #    ⚠️ Genau die gefaehrliche Sorte Fehler: kein Fehlertext, kein
+        #    leerer Rueckgabewert, der nach Fehler aussieht, sondern ein
+        #    Ergebnis, das wie ein Befund gelesen wird ("gibt es nicht").
+        #    Am Ist gefunden am 22.08. beim Bau der Ownership-Karte:
+        #    `list_topics(pattern="display/*", limit=30)` meldete 0, waehrend
+        #    `SELECT COUNT(DISTINCT topic) ... GLOB 'display/*'` **7** liefert.
+        #    🎯 Der Schaden waere im Parallelbetrieb maximal gewesen: die
+        #    Ownership-Pruefung fragt nach Topics, die zwei Besitzer haben —
+        #    und "keine gefunden" ist dort exakt die Antwort, die man hoeren
+        #    will. Ein kaputter Filter haette die Freigabe erteilt.
+        #    SQLite-GLOB und fnmatch sind fuer `*`, `?` und `[...]` deckungs-
+        #    gleich, die Aufrufsyntax aendert sich also nicht.
         sql = ("SELECT topic, COUNT(*) n, MAX(ts) letzte, MIN(ts) erste,"
                " SUM(retained) ret FROM messages")
         args: list = []
+        bedingungen = []
         if since is not None:
-            sql += " WHERE ts >= ?"
+            bedingungen.append("ts >= ?")
             args.append(since)
+        if pattern:
+            bedingungen.append("topic GLOB ?")
+            args.append(pattern)
+        if bedingungen:
+            sql += " WHERE " + " AND ".join(bedingungen)
         sql += " GROUP BY topic ORDER BY letzte DESC LIMIT ?"
         args.append(max(1, limit))
         with self._lock:
             rows = self._db.execute(sql, args).fetchall()
         out = []
         for topic, n, letzte, erste, ret in rows:
-            if pattern and not fnmatch.fnmatch(topic, pattern):
-                continue
             out.append({
                 "topic": topic, "nachrichten": n,
                 "zuletzt": _iso(letzte), "erstmals": _iso(erste),
