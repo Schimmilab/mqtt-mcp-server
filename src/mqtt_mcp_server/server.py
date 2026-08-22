@@ -124,7 +124,8 @@ def get_gaps(seit_stunden: float | None = None) -> dict:
 
 
 @mcp.tool
-def broker_konflikte(seit_stunden: float | None = None, limit: int = 200) -> dict:
+def broker_konflikte(seit_stunden: float | None = None, limit: int = 200,
+                     nur_verdaechtige: bool = True, stichprobe: int = 40) -> dict:
     """Topics, die von MEHR ALS EINEM Broker bespielt werden.
 
     Der Ownership-Canary fuer den Parallelbetrieb zweier Broker: Die
@@ -135,8 +136,23 @@ def broker_konflikte(seit_stunden: float | None = None, limit: int = 200) -> dic
     hat seit dem 22.08. seine eigene). `messbar` sagt, ob das Ergebnis
     ueberhaupt belastbar ist — bei `false` oder `"teilweise"` ist eine leere
     Konfliktliste ausdruecklich KEINE Entwarnung.
+
+    ⛔ Eine BRIDGE ist kein Konflikt. Laeuft eine Bridge zwischen den Brokern,
+    fuehren beide dieselben Topics — das ist der Normalzustand, nicht die
+    Anomalie. Jedes Doppel-Topic wird deshalb eingeordnet:
+
+      gespiegelt                 Bridge belegt (hohe Payload-Gleichheit)
+      wahrscheinlich_gespiegelt  Payloads zu einfoermig fuer einen Beweis,
+                                 aber der Zeitversatz spricht dafuer
+      unabhaengig                ⛔ der echte Befund: zwei Schreiber
+      unklar                     nicht entscheidbar — von Hand ansehen
+
+    `nur_verdaechtige=True` (Default) listet Gespiegeltes nicht, sondern
+    zaehlt es in `gespiegelt_nicht_gelistet`. Auf `False` setzen, um alles zu
+    sehen.
     """
-    e = store.broker_konflikte(cfg.peer_dbs, seit_stunden=seit_stunden, limit=limit)
+    e = store.broker_konflikte(cfg.peer_dbs, seit_stunden=seit_stunden, limit=limit,
+                               nur_verdaechtige=nur_verdaechtige, stichprobe=stichprobe)
     e["anzahl"] = len(e["konflikte"])
     return e
 

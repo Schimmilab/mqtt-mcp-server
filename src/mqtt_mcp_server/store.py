@@ -17,7 +17,11 @@ from __future__ import annotations
 import sqlite3
 import threading
 import time
+from collections import Counter
 from pathlib import Path
+
+# Einordnungen, die KEINE Handlung verlangen — sie werden gezaehlt, nicht gelistet.
+_ENTWARNT = {"gespiegelt", "wahrscheinlich_gespiegelt", "kaum_ueberlappung"}
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
@@ -250,7 +254,8 @@ class Store:
     # ------------------------------------------------- Vergleich ueber Broker
 
     def broker_konflikte(self, peer_pfade: list[Path], seit_stunden: float | None = None,
-                         limit: int = 200) -> dict:
+                         limit: int = 200, nur_verdaechtige: bool = True,
+                         stichprobe: int = 40) -> dict:
         """Welche Topics werden von MEHR ALS EINEM Broker bespielt?
 
         ⭐ Das ist der Ownership-Canary fuer den IPS-Parallelbetrieb: Solange
@@ -270,6 +275,16 @@ class Store:
         Ein stiller Skip waere hier der schlimmstmoegliche Fehler: Das Ergebnis
         waere „keine Konflikte" — also genau die Antwort, die man hoeren will,
         obwohl gar nicht gemessen wurde. (Top-Regel 6e)
+
+        ⛔ EINE BRIDGE IST KEIN KONFLIKT (ergaenzt 2026-08-22, direkt nach dem
+        ersten echten Lauf). Der meldete **129 von 147 Topics** — nicht wegen
+        Doppelsteuerung, sondern weil die Bridge zwischen altem und neuem
+        Broker genau das tut, was sie soll: spiegeln. „Zwei Broker fuehren
+        dasselbe Topic" ist im Parallelbetrieb *mit Bridge* der NORMALZUSTAND.
+        🎯 Ein Werkzeug, das 88 % meldet, wird nach dem dritten Mal ignoriert —
+        exakt die Falle, gegen die dieses Werkzeug gebaut wurde. Deshalb wird
+        jedes Doppel-Topic eingeordnet und Gespiegeltes nur noch GEZAEHLT,
+        nicht gelistet (`nur_verdaechtige=True`, Default).
         """
         quellen = [self.pfad] + [p for p in peer_pfade if Path(p) != self.pfad]
         # uri=True ist PFLICHT: ohne sie liest SQLite "file:...?mode=ro" als
@@ -317,22 +332,40 @@ class Store:
                " ORDER BY MAX(ts) DESC LIMIT ?")
         rows = con.execute(sql, args + [max(1, limit)]).fetchall()
 
+        # Zweiter UNION mit Payload — nur fuer die Spiegelungspruefung, damit
+        # die (haeufigere) Konfliktsuche oben die Blobs nicht mitschleppt.
+        union_p = " UNION ALL ".join(
+            f"SELECT topic, COALESCE(broker,'?') b, ts, payload FROM {a}.messages"
+            f" WHERE aus_backlog = 0" + (" AND ts >= ?" if seit_stunden is not None else "")
+            for a, _ in gelesen)
+
         # Fuer jeden Konflikt aufschluesseln, wer wie oft und wie zuletzt.
-        konflikte = []
+        konflikte, gespiegelt, verteilung = [], 0, Counter()
         for topic, n_b, broker_liste, n, letzte in rows:
             detail_sql = (f"WITH alle AS ({union})"
                           " SELECT b, COUNT(*), MAX(ts) FROM alle"
                           " WHERE topic = ? AND b <> '?'"
-                          " GROUP BY b ORDER BY MAX(ts) DESC")
+                          " GROUP BY b ORDER BY COUNT(*) DESC")
             je = con.execute(detail_sql, args + [topic]).fetchall()
-            konflikte.append({
+            eintrag = {
                 "topic": topic,
                 "broker_anzahl": n_b,
                 "broker": broker_liste,
                 "zuletzt": _iso(letzte),
                 "je_broker": [{"broker": b, "nachrichten": c, "zuletzt": _iso(t)}
                               for b, c, t in je],
-            })
+            }
+            eintrag.update(self._einordnen(con, union_p, args, topic,
+                                           [b for b, _, _ in je], stichprobe))
+            verteilung[eintrag["einordnung"]] += 1
+            # ⭐ Gelistet wird, was NICHT entwarnt ist. Alle drei Entwarnungen
+            #    zusammen sind der Grund, warum das Werkzeug ueberhaupt lesbar
+            #    bleibt: Beim ersten echten Lauf standen 129 Zeilen da, davon
+            #    keine einzige mit Handlungsbedarf.
+            if nur_verdaechtige and eintrag["einordnung"] in _ENTWARNT:
+                gespiegelt += 1
+                continue
+            konflikte.append(eintrag)
         gesamt_topics = con.execute(
             f"WITH alle AS ({union}) SELECT COUNT(DISTINCT topic) FROM alle", args).fetchone()[0]
         # ⛔ ALTBESTAND OHNE HERKUNFT IST DIE ZWEITE FALLE (und die subtilere).
@@ -352,6 +385,26 @@ class Store:
             "topics_geprueft": gesamt_topics,
             "konflikte": konflikte,
         }
+        ergebnis["einordnungen"] = dict(verteilung.most_common())
+        # ⭐ „Unklar aus Datenmangel" ist etwas anderes als „unklar trotz Daten".
+        #    Frisch getrennte Datenbanken haben zwangslaeufig viele Topics, die
+        #    ausser dem Startschwall noch nichts gesehen haben — das als Befund
+        #    zu lesen waere falsch, und es loest sich mit Laufzeit von selbst.
+        duenn = sum(1 for k in konflikte
+                    if k["einordnung"] == "unklar"
+                    and ("Stichprobe" in k.get("grund", "")
+                         or "Startschwall" in k.get("grund", "")
+                         or "zu duenn" in k.get("grund", "")))
+        if duenn:
+            ergebnis["unklar_wegen_datenmangel"] = duenn
+            ergebnis["hinweis"] = (f"{duenn} der gelisteten Topics sind nur deshalb unklar, weil "
+                                   "noch zu wenige Nachrichten vorliegen — nicht, weil etwas "
+                                   "auffaellig waere. Das klaert sich mit Laufzeit von selbst.")
+        if gespiegelt:
+            # ⭐ Gezaehlt statt gelistet — dieselbe Loesung wie bei den lauten
+            #    Capture-Typen: Das Signal bleibt sichtbar, das Rauschen wird
+            #    zu einer Zeile. Mit nur_verdaechtige=False sind sie wieder da.
+            ergebnis["entwarnt_nicht_gelistet"] = gespiegelt
         if ohne:
             anteil = round(100 * ohne / max(1, alle_n))
             ergebnis["zeilen_ohne_herkunft"] = {"anzahl": ohne, "anteil_prozent": anteil}
@@ -371,6 +424,134 @@ class Store:
             ergebnis["warnung"] = ("Mindestens eine Datenbank war nicht lesbar. "
                                    "'Keine Konflikte' ist damit NICHT belegt.")
         return ergebnis
+
+    # Grenzwerte der Einordnung. Am Ist kalibriert (2026-08-22, 12 Topics ueber
+    # beide Broker): Spiegelung liegt bei 95-100 % Paarquote und 19-66 ms
+    # Versatz — die Luecke zu allem anderen ist gross, die Schwellen liegen
+    # bewusst mittendrin und nicht knapp am Messwert.
+    _SPIEGEL_QUOTE = 0.9      # ab hier gilt Payload-Gleichheit als Beleg
+    _SPIEGEL_MS = 250         # Versatz, unterhalb dessen eine Bridge plausibel ist
+    _VIELFALT_MIN = 0.5       # verschiedene Payloads / Stichprobe
+
+    def _einordnen(self, con, union_p: str, args: list, topic: str,
+                   broker: list[str], stichprobe: int) -> dict:
+        """Ist das Doppel eine BRIDGE-Spiegelung oder schreiben zwei unabhaengig?
+
+        Verfahren: Fuer jede Nachricht des einen Brokers den ZEITLICH
+        NAECHSTEN Partner des anderen suchen und pruefen, ob der Payload
+        identisch ist.
+
+        ⛔ „Zeitlich naechster Partner je Nachricht" ist nicht dasselbe wie
+        „alle Paare im Zeitfenster". Der erste Anlauf am 22.08. nahm alle —
+        ein Kreuzprodukt, das bei hochfrequenten Topics sowohl die Quote als
+        auch den Versatz verfaelschte (17 % / 2.327 ms statt real ~100 % /
+        ~40 ms). Die Zahl sah plausibel aus und war Unsinn.
+
+        ⭐ PAYLOAD-VIELFALT ENTSCHEIDET, OB DIE QUOTE UEBERHAUPT ETWAS SAGT.
+        Bei `tele/.../SENSOR` sind 640 von 640 Payloads verschieden — eine
+        Uebereinstimmung ist dort ein starker Beleg. Bei `cmnd/.../POWER`
+        gibt es vier Werte (ON/OFF/0/1), da trifft man zufaellig. Genau
+        deshalb kam dieses Topic auf 62 %, obwohl der Versatz mit 17 ms
+        eindeutig nach Bridge aussah. **Bei geringer Vielfalt wird deshalb
+        NICHT „unabhaengig" behauptet, sondern „unklar" gemeldet** — eine
+        ehrliche Nichtauskunft statt eines erfundenen Befundes.
+        """
+        if len(broker) != 2:
+            return {"einordnung": "unklar",
+                    "grund": f"{len(broker)} Quellen — die Paarpruefung deckt genau zwei ab"}
+        a, b = broker
+        hole = (f"WITH alle AS ({union_p})"
+                " SELECT ts, payload FROM alle WHERE topic = ? AND b = ?"
+                " ORDER BY ts DESC LIMIT ?")
+        links = con.execute(hole, args + [topic, a, max(5, stichprobe)]).fetchall()
+        if not links:
+            return {"einordnung": "unklar", "grund": "keine Nachrichten ausserhalb des Startschwalls"}
+
+        partner = (f"WITH alle AS ({union_p})"
+                   " SELECT payload, ABS(ts - ?) d FROM alle"
+                   " WHERE topic = ? AND b = ? AND ABS(ts - ?) <= 10"
+                   " ORDER BY d LIMIT 1")
+        treffer, abstaende = 0, []
+        for ts, payload in links:
+            r = con.execute(partner, args + [ts, topic, b, ts]).fetchone()
+            if r is None:
+                continue
+            abstaende.append(r[1])
+            if r[0] == payload:
+                treffer += 1
+        n = len(links)
+        # ⛔ KEIN PARTNER IST NICHT DASSELBE WIE FALSCHER PAYLOAD (Fund im
+        #    zweiten Realtest, 22.08.). Erste Fassung teilte die Treffer durch
+        #    ALLE Nachrichten — fand sich zu keiner ein Gegenstueck, kam
+        #    `quote = 0` heraus und der Code meldete „nur 0 % identische
+        #    Payloads … sieht nach zwei Schreibern aus". **Gemessen wurde
+        #    aber gar keine Abweichung, sondern Abwesenheit.** Real betraf das
+        #    die bedjet-Topics: Sie liefen praktisch nur auf einem Broker.
+        # 🎯 Zwei Broker, die dasselbe Topic fuehren, aber NIE gleichzeitig,
+        #    sind ein Umzug — keine Doppelsteuerung. Das ist fuer die
+        #    Ownership-Frage die Entwarnung, nicht der Alarm.
+        gefunden = len(abstaende)
+        quote = treffer / gefunden if gefunden else 0.0
+        abstaende.sort()
+        median_ms = round(abstaende[len(abstaende)//2] * 1000) if abstaende else None
+        vielfalt = len({p for _, p in links}) / n
+
+        d = {"paar_quote": round(quote, 2),
+             "versatz_ms": median_ms,
+             "payload_vielfalt": round(vielfalt, 2),
+             "stichprobe": n,
+             "mit_partner": gefunden}
+
+        if gefunden / n < 0.5:
+            d["einordnung"] = "kaum_ueberlappung"
+            d["grund"] = (f"nur {gefunden} von {n} Nachrichten haben ueberhaupt ein Gegenstueck "
+                          "beim anderen Broker im 10-s-Fenster — die beiden senden nicht "
+                          "gleichzeitig. Das sieht nach Umzug aus, nicht nach Doppelsteuerung.")
+            return d
+        # ⛔ KORREKTUR AM ERSTEN REALTEST (22.08.): Die Vielfalt greift an der
+        #    FALSCHEN Stelle, wenn man sie vorschaltet. Erste Fassung stufte
+        #    alles mit wenigen verschiedenen Payloads auf "wahrscheinlich"
+        #    zurueck — und ordnete damit 104 Topics ein, die bei einer Quote
+        #    von **1,0** standen. Das Rauschen war nur umbenannt, nicht weg.
+        # 🎯 Der Denkfehler: Eine geringe Vielfalt macht eine MITTLERE Quote
+        #    unbrauchbar (bei vier Werten trifft man in 25 % der Faelle
+        #    zufaellig) — eine HOHE Quote dagegen nicht. 40 Treffer in Folge
+        #    bei vier moeglichen Werten sind 0,25^40; das ist kein Zufall,
+        #    egal wie einfoermig die Payloads sind. Die Vielfalt entscheidet
+        #    also erst DANN, wenn die Quote allein nicht reicht.
+        if quote >= self._SPIEGEL_QUOTE and gefunden >= 20:
+            d["einordnung"] = "gespiegelt"
+            d["grund"] = (f"{round(quote*100)} % identische Payloads beim naechsten Partner "
+                          f"ueber {gefunden} Paare"
+                          + (f", Versatz {median_ms} ms" if median_ms is not None else ""))
+        elif quote >= self._SPIEGEL_QUOTE:
+            # Hohe Quote, aber duenne Stichprobe — nicht als Beleg verkaufen.
+            d["einordnung"] = "wahrscheinlich_gespiegelt"
+            d["grund"] = (f"{round(quote*100)} % identische Payloads, aber nur {gefunden} Paare "
+                          "in der Stichprobe — zu wenig fuer einen Beleg")
+        elif vielfalt < self._VIELFALT_MIN:
+            # Mittlere Quote UND einfoermige Payloads: hier liegt der
+            # Zufallsbereich, hier wird nichts behauptet.
+            zufall = round(100 / max(1, round(vielfalt * n)))
+            d["einordnung"] = "unklar"
+            d["grund"] = (f"Quote {round(quote*100)} % bei nur {round(vielfalt*n)} verschiedenen "
+                          f"Payloads — Zufallstreffer liegen bei ~{zufall} %. Weder Bridge noch "
+                          "zwei Schreiber belegt, von Hand ansehen.")
+        elif gefunden >= 20:
+            d["einordnung"] = "unabhaengig"
+            d["grund"] = (f"nur {round(quote*100)} % identische Payloads bei hoher Vielfalt "
+                          f"({round(vielfalt*100)} %) ueber {gefunden} Paare — "
+                          "sieht nach zwei Schreibern aus")
+        else:
+            # ⛔ SYMMETRIE, aufgefallen im dritten Realtest: Die Mindest-
+            #    Stichprobe galt nur fuer "gespiegelt". Der EINZIGE gemeldete
+            #    Verdachtsfall stand danach auf 6 Paaren — ein Alarm aus sechs
+            #    Datenpunkten, und zwar im einzigen Feld, das ueberhaupt Alarm
+            #    ausloest. Ein Fehlalarm ist dort am teuersten.
+            d["einordnung"] = "unklar"
+            d["grund"] = (f"Quote {round(quote*100)} % spraeche fuer zwei Schreiber, aber nur "
+                          f"{gefunden} Paare in der Stichprobe — zu duenn fuer einen Alarm.")
+        return d
 
     def stats(self) -> dict:
         with self._lock:

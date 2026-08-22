@@ -28,7 +28,7 @@ This server answers all three.
 | `get_tree(prefix, tiefe)` | Topic tree, like MQTT Explorer |
 | `find_silent(still_seit_stunden)` | Topics that **stopped** reporting |
 | `get_gaps(seit_stunden)` | When was the collector disconnected? |
-| `broker_konflikte(seit_stunden)` | **Which topics are fed by more than one broker?** — the ownership canary for running two brokers side by side |
+| `broker_konflikte(seit_stunden, nur_verdaechtige)` | **Which topics are fed by more than one broker — and is that a bridge or two writers?** |
 | `status()` | Connection, data volume, write mode |
 | `publish(topic, payload, qos, retain)` | Send a message — **disabled by default** |
 
@@ -97,6 +97,32 @@ the whole tool: an empty conflict list is **only** an all-clear when
 predate the `broker` column, you get `"teilweise"` plus a warning — because
 "no conflicts found" is exactly the answer you were hoping for, and that is
 precisely when a broken measurement does the most damage.
+
+### A bridge is not a conflict
+
+If a bridge runs between the brokers, both carry the same topics — that is
+the normal state, not the anomaly. The first real run reported **129 of 147
+topics**, none of which needed action. A tool that flags 88 % gets ignored by
+the third time, so every doubled topic is classified:
+
+| | |
+|---|---|
+| `gespiegelt` | bridge proven — for each message, the nearest message on the other broker carries an identical payload |
+| `wahrscheinlich_gespiegelt` | same pattern, but too few pairs to call it proven |
+| `kaum_ueberlappung` | the two rarely send at the same time — that is a *migration*, not double control |
+| `unabhaengig` | **the real finding**: overlapping in time, different payloads |
+| `unklar` | not decidable — reported as such rather than guessed |
+
+Two details decide whether the classification is honest rather than merely
+confident:
+
+- **Nearest partner per message, not all pairs in the window.** The naive
+  version is a cross join and lies badly on high-frequency topics.
+- **No partner ≠ different payload.** Dividing hits by *all* messages turns
+  absence into "0 % identical", which reads as "two writers". It isn't.
+
+`nur_verdaechtige=True` (default) lists only what is not cleared, and counts
+the rest in `entwarnt_nicht_gelistet`.
 
 ## Writing is off by default — on purpose
 
