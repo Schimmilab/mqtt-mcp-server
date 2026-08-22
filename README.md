@@ -124,6 +124,14 @@ confident:
 `nur_verdaechtige=True` (default) lists only what is not cleared, and counts
 the rest in `entwarnt_nicht_gelistet`.
 
+**Verify the canary itself.** A canary that finds nothing is indistinguishable
+from a broken one, so `tools/canary-doppelbesitz.py` publishes two test topics:
+one written independently by both brokers (must be reported as `unabhaengig`)
+and one written identically by both (must be cleared). Run it, then call
+`broker_konflikte(seit_stunden=0.1)` and check that exactly the first one shows
+up. Without the second topic the first proves nothing — a canary that flags
+*everything* would pass it too.
+
 ## Writing is off by default — on purpose
 
 `publish` requires **two** conditions: write mode enabled *and* the topic not on the
