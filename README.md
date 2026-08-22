@@ -28,6 +28,7 @@ This server answers all three.
 | `get_tree(prefix, tiefe)` | Topic tree, like MQTT Explorer |
 | `find_silent(still_seit_stunden)` | Topics that **stopped** reporting |
 | `get_gaps(seit_stunden)` | When was the collector disconnected? |
+| `broker_konflikte(seit_stunden)` | **Which topics are fed by more than one broker?** — the ownership canary for running two brokers side by side |
 | `status()` | Connection, data volume, write mode |
 | `publish(topic, payload, qos, retain)` | Send a message — **disabled by default** |
 
@@ -65,11 +66,37 @@ are fixed at session start.
 | `MQTT_MCP_PORT` | `1883` | |
 | `MQTT_MCP_USERNAME` / `_PASSWORD` | — | optional auth |
 | `MQTT_MCP_TOPICS` | `#` | comma-separated subscription filters |
-| `MQTT_MCP_DB` | `~/.local/share/mqtt-mcp/history.db` | |
+| `MQTT_MCP_DB` | `~/.local/share/mqtt-mcp/history.db` | **one file per broker** — see below |
+| `MQTT_MCP_PEER_DBS` | all other `*.db` next to `MQTT_MCP_DB` | databases to compare against |
 | `MQTT_MCP_RETENTION_TAGE` | `30` | delete messages older than this |
 | `MQTT_MCP_MAX_DB_MB` | `2048` | hard cap, triggers oldest-first deletion |
 | `MQTT_MCP_ALLOW_PUBLISH` | `false` | **write mode** |
 | `MQTT_MCP_BLOCKED_TOPICS` | see `config.py` | never published to, even in write mode |
+
+## Running two brokers side by side
+
+Migrating a home automation system rarely happens in one jump. While the old
+and the new broker run in parallel, **the same topic exists on both** — and a
+value without a recorded origin is not wrong, it is *unattributable*. That is
+the worse kind of error, because it still looks like a measurement.
+
+Two things make this visible:
+
+- Every row carries a **`broker` column** (`host:port`). Rows written before
+  this existed stay `NULL` — deliberately. Backfilling them with the current
+  broker would be an invented origin.
+- **Give each broker its own database file** (`MQTT_MCP_DB`). The origin is
+  then guaranteed structurally, not merely by a column somebody has to fill
+  correctly. `broker_konflikte()` attaches all of them read-only and answers
+  the one question that matters: *which topics are fed by more than one
+  broker?*
+
+The result carries a `messbar` ("measurable") field, and it is the point of
+the whole tool: an empty conflict list is **only** an all-clear when
+`messbar` is `true`. If a peer database could not be read, or if most rows
+predate the `broker` column, you get `"teilweise"` plus a warning — because
+"no conflicts found" is exactly the answer you were hoping for, and that is
+precisely when a broken measurement does the most damage.
 
 ## Writing is off by default — on purpose
 

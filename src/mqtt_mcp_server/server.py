@@ -15,7 +15,7 @@ from .collector import Collector
 from .store import Store
 
 cfg = Config()
-store = Store(cfg.db_pfad)
+store = Store(cfg.db_pfad, broker=cfg.broker_kennung)
 collector = Collector(cfg, store)
 
 mcp = FastMCP("mqtt-mcp-server")
@@ -124,6 +124,24 @@ def get_gaps(seit_stunden: float | None = None) -> dict:
 
 
 @mcp.tool
+def broker_konflikte(seit_stunden: float | None = None, limit: int = 200) -> dict:
+    """Topics, die von MEHR ALS EINEM Broker bespielt werden.
+
+    Der Ownership-Canary fuer den Parallelbetrieb zweier Broker: Die
+    gefaehrliche Lage ist nicht "ein Geraet antwortet nicht", sondern "zwei
+    Systeme schreiben auf dasselbe Topic und keiner merkt es".
+
+    Verglichen wird ueber ALLE Broker-Datenbanken nebeneinander (jeder Server
+    hat seit dem 22.08. seine eigene). `messbar` sagt, ob das Ergebnis
+    ueberhaupt belastbar ist — bei `false` oder `"teilweise"` ist eine leere
+    Konfliktliste ausdruecklich KEINE Entwarnung.
+    """
+    e = store.broker_konflikte(cfg.peer_dbs, seit_stunden=seit_stunden, limit=limit)
+    e["anzahl"] = len(e["konflikte"])
+    return e
+
+
+@mcp.tool
 def status() -> dict:
     """Zustand des Servers: Verbindung, Datenbestand, Schreibmodus."""
     return {
@@ -133,6 +151,8 @@ def status() -> dict:
         "letzter_fehler": collector.letzter_fehler,
         "abonniert": cfg.topics,
         "datenbank": str(cfg.db_pfad),
+        "broker_kennung": cfg.broker_kennung,
+        "vergleichs_datenbanken": [str(p) for p in cfg.peer_dbs],
         "bestand": store.stats(),
         "retention": f"{cfg.retention_tage} Tage / {cfg.max_db_mb} MB",
         "schreibmodus": "AKTIV" if cfg.publish_erlaubt else "aus (read-only)",

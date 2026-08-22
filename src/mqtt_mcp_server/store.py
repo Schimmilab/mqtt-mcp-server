@@ -27,16 +27,22 @@ CREATE TABLE IF NOT EXISTS messages (
     payload     BLOB,
     qos         INTEGER NOT NULL DEFAULT 0,
     retained    INTEGER NOT NULL DEFAULT 0,  -- MQTT-Retain-Flag
-    aus_backlog INTEGER NOT NULL DEFAULT 0   -- kam im Schwall direkt nach dem Verbinden
+    aus_backlog INTEGER NOT NULL DEFAULT 0,  -- kam im Schwall direkt nach dem Verbinden
+    broker      TEXT                         -- host:port der Quelle; NULL = Altbestand
 );
 CREATE INDEX IF NOT EXISTS idx_msg_topic_ts ON messages(topic, ts DESC);
 CREATE INDEX IF NOT EXISTS idx_msg_ts       ON messages(ts DESC);
+-- ⛔ idx_msg_broker steht bewusst NICHT hier, sondern in _migriere(): Bei einer
+--    DB aus der Zeit vor dem 22.08. gibt es die Spalte noch nicht, und
+--    `CREATE INDEX` liefe hier VOR dem `ALTER TABLE`. Am Ist gesehen —
+--    der erste Testlauf starb mit "no such column: broker".
 
 CREATE TABLE IF NOT EXISTS connection_events (
     id     INTEGER PRIMARY KEY AUTOINCREMENT,
     ts     REAL NOT NULL,
     event  TEXT NOT NULL,      -- 'connected' | 'disconnected'
-    detail TEXT
+    detail TEXT,
+    broker TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_conn_ts ON connection_events(ts DESC);
 """
@@ -50,16 +56,45 @@ def _text(payload: bytes | None, limit: int = 400) -> str:
 
 
 class Store:
-    def __init__(self, pfad: Path) -> None:
+    """⭐ `broker` beantwortet die Frage WOHER, nicht nur WAS (neu 2026-08-22).
+
+    Bis dahin trug eine Zeile nur `topic` und `ts`. Solange ein Rechner genau
+    einen Broker kennt, reicht das — im **Parallelbetrieb** nicht mehr: Dort
+    existiert dasselbe Topic auf altem und neuem Broker gleichzeitig, und ein
+    Wert ohne Herkunft ist dann nicht falsch, sondern **unzuordenbar**. Das ist
+    die unangenehmere Sorte Fehler, weil er wie ein Messwert aussieht.
+
+    ⛔ Bestehende Zeilen bekommen `broker = NULL`, nicht etwa den aktuellen
+    Broker nachgetragen. Der Altbestand IST unzuordenbar — ihn nachtraeglich
+    zu etikettieren, waere eine erfundene Herkunft.
+    """
+
+    def __init__(self, pfad: Path, broker: str | None = None) -> None:
         self.pfad = pfad
+        self.broker = broker
         # check_same_thread=False: der MQTT-Thread schreibt, der MCP-Thread liest.
         # WAL, damit Leser den Schreiber nicht blockieren (im Spike verifiziert).
         self._db = sqlite3.connect(pfad, check_same_thread=False, timeout=10)
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA synchronous=NORMAL")
         self._db.executescript(SCHEMA)
+        self._migriere()
         self._db.commit()
         self._lock = threading.Lock()
+
+    def _migriere(self) -> None:
+        """`broker` in bestehende Datenbanken nachziehen. Idempotent.
+
+        `CREATE TABLE IF NOT EXISTS` fasst eine vorhandene Tabelle nicht an —
+        ohne diesen Schritt haette eine bestehende DB die neue Spalte nie
+        bekommen und jeder Insert waere gescheitert.
+        """
+        for tabelle in ("messages", "connection_events"):
+            spalten = {r[1] for r in self._db.execute(f"PRAGMA table_info({tabelle})")}
+            if "broker" not in spalten:
+                self._db.execute(f"ALTER TABLE {tabelle} ADD COLUMN broker TEXT")
+        self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_msg_broker ON messages(broker, topic)")
 
     # ---------------------------------------------------------------- schreiben
 
@@ -67,18 +102,19 @@ class Store:
                     aus_backlog: bool, ts: float | None = None) -> None:
         with self._lock:
             self._db.execute(
-                "INSERT INTO messages (ts, topic, payload, qos, retained, aus_backlog)"
-                " VALUES (?,?,?,?,?,?)",
+                "INSERT INTO messages (ts, topic, payload, qos, retained, aus_backlog, broker)"
+                " VALUES (?,?,?,?,?,?,?)",
                 (ts if ts is not None else time.time(), topic, payload, qos,
-                 1 if retained else 0, 1 if aus_backlog else 0),
+                 1 if retained else 0, 1 if aus_backlog else 0, self.broker),
             )
             self._db.commit()
 
     def add_connection_event(self, event: str, detail: str = "") -> None:
         with self._lock:
             self._db.execute(
-                "INSERT INTO connection_events (ts, event, detail) VALUES (?,?,?)",
-                (time.time(), event, detail),
+                "INSERT INTO connection_events (ts, event, detail, broker)"
+                " VALUES (?,?,?,?)",
+                (time.time(), event, detail, self.broker),
             )
             self._db.commit()
 
@@ -104,7 +140,9 @@ class Store:
         #    SQLite-GLOB und fnmatch sind fuer `*`, `?` und `[...]` deckungs-
         #    gleich, die Aufrufsyntax aendert sich also nicht.
         sql = ("SELECT topic, COUNT(*) n, MAX(ts) letzte, MIN(ts) erste,"
-               " SUM(retained) ret FROM messages")
+               " SUM(retained) ret,"
+               " COUNT(DISTINCT COALESCE(broker,'?')) quellen,"
+               " GROUP_CONCAT(DISTINCT COALESCE(broker,'?')) broker FROM messages")
         args: list = []
         bedingungen = []
         if since is not None:
@@ -120,26 +158,33 @@ class Store:
         with self._lock:
             rows = self._db.execute(sql, args).fetchall()
         out = []
-        for topic, n, letzte, erste, ret in rows:
-            out.append({
+        for topic, n, letzte, erste, ret, quellen, broker in rows:
+            eintrag = {
                 "topic": topic, "nachrichten": n,
                 "zuletzt": _iso(letzte), "erstmals": _iso(erste),
                 "nur_retained": bool(ret == n),
-            })
+                "broker": broker,
+            }
+            # ⛔ Mehrere Quellen fuer EIN Topic: im Parallelbetrieb ist das der
+            #    Befund, nicht ein Detail. Deshalb als eigenes Feld und nicht
+            #    nur implizit in einer kommagetrennten Liste.
+            if quellen > 1:
+                eintrag["mehrere_quellen"] = True
+            out.append(eintrag)
         return out
 
     def get_last(self, topic: str) -> dict | None:
         with self._lock:
             r = self._db.execute(
-                "SELECT ts, payload, qos, retained, aus_backlog FROM messages"
+                "SELECT ts, payload, qos, retained, aus_backlog, broker FROM messages"
                 " WHERE topic = ? ORDER BY ts DESC LIMIT 1", (topic,)).fetchone()
         if not r:
             return None
-        ts, payload, qos, retained, backlog = r
+        ts, payload, qos, retained, backlog, broker = r
         return {
             "topic": topic, "wert": _text(payload), "zeit": _iso(ts),
             "alter_sekunden": round(time.time() - ts, 1),
-            "qos": qos, "retained": bool(retained),
+            "qos": qos, "retained": bool(retained), "broker": broker,
             # Ehrlichkeitsflag: der Wert kam aus dem Startschwall. Der Zeitstempel
             # sagt, wann WIR ihn gesehen haben — nicht, wann er entstanden ist.
             "aus_startschwall": bool(backlog),
@@ -147,7 +192,8 @@ class Store:
 
     def get_history(self, topic: str, since: float | None = None, until: float | None = None,
                     limit: int = 200, mit_backlog: bool = True) -> list[dict]:
-        sql = "SELECT ts, payload, qos, retained, aus_backlog FROM messages WHERE topic = ?"
+        sql = ("SELECT ts, payload, qos, retained, aus_backlog, broker FROM messages"
+               " WHERE topic = ?")
         args: list = [topic]
         if since is not None:
             sql += " AND ts >= ?"; args.append(since)
@@ -160,8 +206,8 @@ class Store:
         with self._lock:
             rows = self._db.execute(sql, args).fetchall()
         return [{"zeit": _iso(ts), "wert": _text(p), "qos": q,
-                 "retained": bool(r), "aus_startschwall": bool(b)}
-                for ts, p, q, r, b in rows]
+                 "retained": bool(r), "aus_startschwall": bool(b), "broker": brk}
+                for ts, p, q, r, b, brk in rows]
 
     def find_silent(self, seit_sekunden: float, limit: int = 200) -> list[dict]:
         grenze = time.time() - seit_sekunden
@@ -200,6 +246,131 @@ class Store:
                             "dauer_minuten": round((time.time() - offen[0]) / 60, 1),
                             "grund": offen[1] or "", "hinweis": "noch offen"})
         return luecken
+
+    # ------------------------------------------------- Vergleich ueber Broker
+
+    def broker_konflikte(self, peer_pfade: list[Path], seit_stunden: float | None = None,
+                         limit: int = 200) -> dict:
+        """Welche Topics werden von MEHR ALS EINEM Broker bespielt?
+
+        ⭐ Das ist der Ownership-Canary fuer den IPS-Parallelbetrieb: Solange
+        alter und neuer Broker nebeneinander laufen, ist die gefaehrliche Lage
+        nicht „ein Geraet antwortet nicht", sondern „zwei Systeme schreiben auf
+        dasselbe Topic und keiner merkt es".
+
+        ⛔ WARUM UEBER MEHRERE DATEIEN UND NICHT UEBER EINE SPALTE ALLEIN:
+        Seit dem 22.08. hat jeder Server seine eigene DB — die Herkunft ist
+        damit **strukturell** garantiert und nicht davon abhaengig, dass die
+        `broker`-Spalte korrekt gefuellt wurde. Der Vergleich braucht dann
+        aber beide Dateien; ATTACH holt sie in EINE Abfrage. Die Spalte bleibt
+        trotzdem noetig: Sie macht jede Zeile selbstbeschreibend, auch wenn
+        Dateien kopiert oder spaeter zusammengelegt werden.
+
+        ⛔ NICHT LESBARE PEER-DATENBANKEN WERDEN GEMELDET, NICHT UEBERSPRUNGEN.
+        Ein stiller Skip waere hier der schlimmstmoegliche Fehler: Das Ergebnis
+        waere „keine Konflikte" — also genau die Antwort, die man hoeren will,
+        obwohl gar nicht gemessen wurde. (Top-Regel 6e)
+        """
+        quellen = [self.pfad] + [p for p in peer_pfade if Path(p) != self.pfad]
+        # uri=True ist PFLICHT: ohne sie liest SQLite "file:...?mode=ro" als
+        # normalen Dateinamen, jedes ATTACH scheitert — und das Ergebnis waere
+        # `messbar: False`. Immerhin laut, nicht still. Am Ist gesehen.
+        con = sqlite3.connect(":memory:", uri=True)
+        gelesen, nicht_lesbar = [], []
+        for i, pfad in enumerate(quellen):
+            alias = f"q{i}"
+            try:
+                con.execute("ATTACH DATABASE ? AS " + alias,
+                            (f"file:{Path(pfad)}?mode=ro", ))
+                con.execute(f"SELECT 1 FROM {alias}.messages LIMIT 1")
+                gelesen.append((alias, str(pfad)))
+            except sqlite3.Error as e:
+                nicht_lesbar.append({"datei": str(pfad), "grund": str(e)})
+
+        if not gelesen:
+            con.close()
+            return {"messbar": False, "konflikte": [],
+                    "hinweis": "KEINE Datenbank lesbar — dies ist KEIN 'keine Konflikte'.",
+                    "nicht_lesbar": nicht_lesbar}
+
+        wo, args = "", []
+        if seit_stunden is not None:
+            wo = " WHERE ts >= ?"
+            args = [time.time() - seit_stunden * 3600] * len(gelesen)
+        union = " UNION ALL ".join(
+            f"SELECT topic, COALESCE(broker,'?') b, ts FROM {a}.messages{wo}"
+            for a, _ in gelesen)
+        # ⛔ '?' (= Altbestand ohne Herkunft) zaehlt NICHT als eigene Quelle.
+        #    Der Test hat den Denkfehler aufgedeckt: Sonst haette der erste
+        #    Lauf nach der Umstellung **jedes** Topic als Konflikt gemeldet —
+        #    Altzeilen '?' plus neue Zeilen 'host:port' sind formal zwei
+        #    Quellen, inhaltlich aber nur "vorher unbekannt, jetzt bekannt".
+        #    Hunderte Pseudo-Konflikte, und nach dem dritten liest niemand
+        #    mehr hin: exakt die withings-Falle. Der NULL-Anteil wird
+        #    stattdessen als eigenes Feld ausgewiesen (siehe unten) — sichtbar,
+        #    aber nicht als Alarm getarnt.
+        sql = (f"WITH alle AS ({union})"
+               " SELECT topic, COUNT(DISTINCT b), GROUP_CONCAT(DISTINCT b),"
+               "        COUNT(*), MAX(ts)"
+               " FROM alle WHERE b <> '?' GROUP BY topic"
+               " HAVING COUNT(DISTINCT b) > 1"
+               " ORDER BY MAX(ts) DESC LIMIT ?")
+        rows = con.execute(sql, args + [max(1, limit)]).fetchall()
+
+        # Fuer jeden Konflikt aufschluesseln, wer wie oft und wie zuletzt.
+        konflikte = []
+        for topic, n_b, broker_liste, n, letzte in rows:
+            detail_sql = (f"WITH alle AS ({union})"
+                          " SELECT b, COUNT(*), MAX(ts) FROM alle"
+                          " WHERE topic = ? AND b <> '?'"
+                          " GROUP BY b ORDER BY MAX(ts) DESC")
+            je = con.execute(detail_sql, args + [topic]).fetchall()
+            konflikte.append({
+                "topic": topic,
+                "broker_anzahl": n_b,
+                "broker": broker_liste,
+                "zuletzt": _iso(letzte),
+                "je_broker": [{"broker": b, "nachrichten": c, "zuletzt": _iso(t)}
+                              for b, c, t in je],
+            })
+        gesamt_topics = con.execute(
+            f"WITH alle AS ({union}) SELECT COUNT(DISTINCT topic) FROM alle", args).fetchone()[0]
+        # ⛔ ALTBESTAND OHNE HERKUNFT IST DIE ZWEITE FALLE (und die subtilere).
+        #    Zeilen von vor dem 22.08. haben `broker IS NULL` und werden zu
+        #    EINER Pseudo-Quelle '?' zusammengefasst. Ein Topic, das damals von
+        #    beiden Brokern bespielt wurde, sieht damit aus wie eines mit genau
+        #    einer Quelle — der Canary meldet nichts, und das liest sich als
+        #    Entwarnung. Es ist aber keine: es ist "nicht messbar".
+        #    Deshalb wird der NULL-Anteil ausgewiesen, nicht weggerechnet.
+        ohne, alle_n = con.execute(
+            f"WITH alle AS ({union}) SELECT SUM(b = '?'), COUNT(*) FROM alle", args).fetchone()
+        con.close()
+
+        ergebnis = {
+            "messbar": True,
+            "gelesene_datenbanken": [d for _, d in gelesen],
+            "topics_geprueft": gesamt_topics,
+            "konflikte": konflikte,
+        }
+        if ohne:
+            anteil = round(100 * ohne / max(1, alle_n))
+            ergebnis["zeilen_ohne_herkunft"] = {"anzahl": ohne, "anteil_prozent": anteil}
+            if anteil >= 50:
+                ergebnis["messbar"] = "teilweise"
+                ergebnis["warnung"] = (
+                    f"{anteil} % der Zeilen stammen aus der Zeit vor der Broker-Kennung "
+                    "und zaehlen als EINE Quelle. Ein Konflikt darin ist unsichtbar — "
+                    "'keine Konflikte' ist fuer diesen Zeitraum NICHT belegt. "
+                    "Belastbar wird die Auskunft erst fuer Daten, die nach der "
+                    "Umstellung entstanden sind (seit_stunden einschraenken).")
+        if nicht_lesbar:
+            # Teilmessung ist KEINE Messung — das muss im Ergebnis stehen,
+            # nicht nur im Log.
+            ergebnis["messbar"] = "teilweise"
+            ergebnis["nicht_lesbar"] = nicht_lesbar
+            ergebnis["warnung"] = ("Mindestens eine Datenbank war nicht lesbar. "
+                                   "'Keine Konflikte' ist damit NICHT belegt.")
+        return ergebnis
 
     def stats(self) -> dict:
         with self._lock:

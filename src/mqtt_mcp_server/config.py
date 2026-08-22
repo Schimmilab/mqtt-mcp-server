@@ -61,3 +61,29 @@ class Config:
 
     def __post_init__(self) -> None:
         self.db_pfad.parent.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def broker_kennung(self) -> str:
+        """Was in jede Zeile als Herkunft geschrieben wird.
+
+        `host:port` und nicht etwa der MCP-Servername: Der Servername lebt in
+        `~/.claude.json` und kann sich aendern, ohne dass sich die Quelle
+        aendert — dann waere die Historie in sich widerspruechlich.
+        """
+        return f"{self.host}:{self.port}"
+
+    @property
+    def peer_dbs(self) -> list[Path]:
+        """Datenbanken anderer Broker, gegen die verglichen werden kann.
+
+        ⭐ Default: alle `*.db` NEBEN der eigenen. Seit der Trennung am
+        22.08. hat jeder Broker seine eigene Datei im selben Verzeichnis —
+        eine Konvention, die keiner Pflege beduerftig ist (Top-Regel 7:
+        Mechanismus statt Vorsatz; eine Liste, die jemand nachtragen muesste,
+        waere beim dritten Broker veraltet).
+        Ueberschreibbar per `MQTT_MCP_PEER_DBS` (kommagetrennt).
+        """
+        roh = os.environ.get("MQTT_MCP_PEER_DBS")
+        if roh:
+            return [Path(t.strip()).expanduser() for t in roh.split(",") if t.strip()]
+        return sorted(p for p in self.db_pfad.parent.glob("*.db") if p != self.db_pfad)
