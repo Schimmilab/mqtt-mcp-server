@@ -38,6 +38,22 @@ This server answers all three.
 period. A topic can look "silent" simply because nobody was listening. The server
 refuses to let you confuse the two.
 
+### A failed connection is not a quiet one
+
+If the broker cannot be reached at all — DNS, routing, firewall, refused — paho
+never calls `on_disconnect`, because there was never a connection. Up to v0.1.0 that
+case left no trace: `status()` showed `verbunden: false` with `letzter_fehler: null`,
+and `get_gaps` showed nothing, so a collector that could not connect looked exactly
+like one that simply received no messages.
+
+Since v0.2.0 a failed attempt is recorded:
+
+- `status().letzter_fehler` carries the real cause and the number of attempts,
+  e.g. `connect fehlgeschlagen (7x): OSError: [Errno 65] No route to host`.
+- **One** `disconnected` event per failure streak (not one per retry — paho keeps
+  retrying with backoff up to 120 s). `get_gaps` shows it as an open gap
+  (`"hinweis": "noch offen"`) until the next successful connect closes it.
+
 ## Install
 
 ```bash
@@ -170,12 +186,24 @@ the obvious fix and is planned.
 started on demand, not a 24/7 collector. If something breaks while you are away and
 no session is open, nothing is recorded.
 
+**macOS: the collector inherits the Local Network permission of whatever launched
+it.** Started from an IDE's terminal (IntelliJ, CLion, VS Code …), Python and Node
+get `EHOSTUNREACH` / *No route to host* for every LAN address if that IDE lacks
+*System Settings → Privacy & Security → Local Network*. Apple's own binaries (`nc`,
+`curl`) are not affected, which makes the failure look selective. Granting the
+permission takes effect only after **restarting the IDE**. Since v0.2.0 the cause
+shows up in `status().letzter_fehler`; before, it did not.
+
 ## Retention
 
 Runs at startup and hourly: delete older than N days, then — if still over the size
 cap — delete oldest-first. **Every cleanup reports what it removed** to stderr,
 including the oldest remaining timestamp. Silent deletion would quietly destroy the
 answer to *"since when has this device been quiet?"*.
+
+Check which limit actually applies: on a busy broker the size cap wins long before
+the day limit. In practice ~1.8 GB held about four days of a home installation with
+~200 topics — `status().bestand.aeltestes` tells you the real horizon.
 
 ## License
 

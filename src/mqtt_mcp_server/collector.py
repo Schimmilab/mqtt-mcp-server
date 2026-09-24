@@ -7,6 +7,7 @@ Rest gebaut wurde — sie war das einzige Risiko, das den Entwurf gekippt haette
 from __future__ import annotations
 
 import fnmatch
+import sys
 import threading
 import time
 
@@ -30,12 +31,14 @@ class Collector:
         self._connect_ts = 0.0
         self.empfangen = 0
         self.letzter_fehler: str | None = None
+        self.fehlversuche = 0
 
         self._client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
         if cfg.username:
             self._client.username_pw_set(cfg.username, cfg.password or None)
         self._client.on_connect = self._on_connect
         self._client.on_disconnect = self._on_disconnect
+        self._client.on_connect_fail = self._on_connect_fail
         self._client.on_message = self._on_message
 
     # ------------------------------------------------------------------ callbacks
@@ -64,9 +67,31 @@ class Collector:
         self._connect_ts = time.time()
         self._verbunden.set()
         self.letzter_fehler = None
+        self.fehlversuche = 0
         self.store.add_connection_event("connected", f"{self.cfg.host}:{self.cfg.port}")
         for t in self.cfg.topics:
             client.subscribe(t, qos=0)
+
+    def _on_connect_fail(self, client, userdata) -> None:
+        """Verbindungsaufbau gescheitert (TCP/DNS) — paho ruft dann NICHT on_disconnect.
+
+        ⛔ Gefunden am 2026-09-24: 27,6 h ohne Daten, weil macOS Python aus der
+        IDE-Session den LAN-Zugriff verweigerte ("No route to host"). Ohne diesen
+        Callback blieb `letzter_fehler` leer und es entstand kein einziges Event —
+        der Sammler sah aus wie einer, der nur gerade keine Nachrichten bekommt.
+
+        paho uebergibt die Exception nicht, ruft uns aber aus seinem
+        `except OSError:`-Block auf — deshalb liefert sys.exc_info() sie hier.
+        Ein Event nur beim ERSTEN Fehlversuch einer Serie: paho versucht es mit
+        Backoff bis 120 s weiter, ein Event pro Versuch waere Rauschen. Die
+        offene Luecke zeigt get_gaps() als "noch offen", bis on_connect sie schliesst.
+        """
+        exc = sys.exc_info()[1]
+        grund = f"{type(exc).__name__}: {exc}" if exc else "unbekannt"
+        self.fehlversuche += 1
+        self.letzter_fehler = f"connect fehlgeschlagen ({self.fehlversuche}x): {grund}"
+        if self.fehlversuche == 1:
+            self.store.add_connection_event("disconnected", f"connect fehlgeschlagen: {grund}")
 
     def _on_disconnect(self, client, userdata, flags=None, rc=None, properties=None) -> None:
         self._verbunden.clear()
