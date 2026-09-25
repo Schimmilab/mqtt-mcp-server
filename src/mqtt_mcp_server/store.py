@@ -563,6 +563,11 @@ class Store:
                 "neuestes": _iso(spanne[1]) if spanne[1] else None,
                 "db_mb": round(self.db_groesse_mb(), 1)}
 
+    def neueste_ts(self) -> float | None:
+        """Zeitstempel der juengsten Nachricht — Frischemass fuer den Nur-Lesen-Modus."""
+        with self._lock:
+            return self._db.execute("SELECT MAX(ts) FROM messages").fetchone()[0]
+
     def db_groesse_mb(self) -> float:
         gesamt = 0
         for suffix in ("", "-wal", "-shm"):

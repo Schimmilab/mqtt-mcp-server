@@ -5,11 +5,11 @@ Sechs lesen, eines schreibt — und das schreibende ist doppelt gesichert
 """
 from __future__ import annotations
 
-import threading
 import time
 
 from fastmcp import FastMCP
 
+from .betrieb import hintergrund_starten, verbindungshinweis
 from .config import Config
 from .collector import Collector
 from .store import Store
@@ -162,8 +162,10 @@ def status() -> dict:
     """Zustand des Servers: Verbindung, Datenbestand, Schreibmodus."""
     return {
         "broker": f"{cfg.host}:{cfg.port}",
+        "sammelmodus": "eigener Sammler" if cfg.sammeln else "nur lesen (Sammler-Dienst extern)",
         "verbunden": collector.ist_verbunden,
         "empfangen_diese_session": collector.empfangen,
+        "hinweis_verbindung": _verbindungshinweis(),
         "letzter_fehler": collector.letzter_fehler,
         "abonniert": cfg.topics,
         "datenbank": str(cfg.db_pfad),
@@ -186,32 +188,11 @@ def publish(topic: str, payload: str, qos: int = 0, retain: bool = False) -> dic
 
 
 def _verbindungshinweis() -> str | None:
-    if collector.ist_verbunden:
-        return None
-    return ("⚠️ Sammler ist derzeit NICHT verbunden — fehlende Daten koennen daran liegen, "
-            "nicht an stillen Geraeten.")
-
-
-def _retention_schleife() -> None:
-    """Raeumt beim Start und danach stuendlich auf. Meldet auf stderr, was wegfiel."""
-    while True:
-        try:
-            b = store.aufraeumen(cfg.retention_tage, cfg.max_db_mb)
-            if b["nach_alter"] or b["nach_groesse"]:
-                import sys
-                print(f"[mqtt-mcp] Retention: {b['nach_alter']} Zeilen ueber "
-                      f"{cfg.retention_tage} Tage, {b['nach_groesse']} wegen Groesse; "
-                      f"{b['db_mb_vorher']} -> {b['db_mb_nachher']} MB; "
-                      f"aeltester Rest {b['aeltester_rest']}", file=sys.stderr)
-        except Exception as e:  # noqa: BLE001
-            import sys
-            print(f"[mqtt-mcp] Retention fehlgeschlagen: {e}", file=sys.stderr)
-        time.sleep(3600)
+    return verbindungshinweis(cfg.sammeln, collector.ist_verbunden, store.neueste_ts())
 
 
 def main() -> None:
-    collector.start()
-    threading.Thread(target=_retention_schleife, daemon=True).start()
+    hintergrund_starten(cfg, collector, store)
     try:
         mcp.run()
     finally:

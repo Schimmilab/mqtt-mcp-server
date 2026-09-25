@@ -14,6 +14,7 @@ dependencies = [
 
 [project.scripts]
 mqtt-mcp-server = "mqtt_mcp_server.server:main"
+mqtt-sammler = "mqtt_mcp_server.sammler:main"
 
 [build-system]
 requires = ["hatchling"]

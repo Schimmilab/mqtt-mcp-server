@@ -58,6 +58,9 @@ class Config:
     # Schreiben ist aus (Entscheidung 5).
     publish_erlaubt: bool = field(default_factory=lambda: _bool("MQTT_MCP_ALLOW_PUBLISH", False))
     gesperrte_topics: list[str] = field(default_factory=lambda: _liste("MQTT_MCP_BLOCKED_TOPICS", DEFAULT_GESPERRT))
+    # Sammelt dieser Prozess selbst? Aus (0), wenn ein eigenstaendiger `mqtt-sammler`
+    # dieselbe DB fuellt und der MCP nur liest (Umzug auf leitstand, 2026-09-25).
+    sammeln: bool = field(default_factory=lambda: _bool("MQTT_MCP_SAMMELN", True))
 
     def __post_init__(self) -> None:
         self.db_pfad.parent.mkdir(parents=True, exist_ok=True)
