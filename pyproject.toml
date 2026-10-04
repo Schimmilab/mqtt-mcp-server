@@ -1,6 +1,6 @@
 [project]
 name = "mqtt-mcp-server"
-version = "0.2.0"
+version = "0.3.0"
 description = "MCP server for MQTT with a searchable message history, silence detection and connection-gap tracking"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -11,6 +11,10 @@ dependencies = [
     "fastmcp>=2.12,<4",
     "paho-mqtt>=2.1,<3",
 ]
+
+[dependency-groups]
+# amqtt: stoppbarer Test-Broker fuer tests/test_broker_e2e.py (Anmeldung, get_gaps, find_silent)
+dev = ["pytest>=8,<9", "amqtt>=0.12,<0.13"]
 
 [project.scripts]
 mqtt-mcp-server = "mqtt_mcp_server.server:main"

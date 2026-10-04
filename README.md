@@ -172,15 +172,24 @@ them.
 
 ## Known limitations
 
-**Broker authentication is implemented but untested against a real broker.**
-`MQTT_MCP_USERNAME` / `MQTT_MCP_PASSWORD` are passed to `username_pw_set()`, and
-unit tests verify they reach the client — but no authenticating broker was
-available during development. If you use auth, verify it works before relying on it.
+**Broker authentication, connection gaps and silence detection are tested end-to-end**
+against a real broker since v0.3.0: `tests/test_broker_e2e.py` starts a killable test
+broker ([amqtt](https://github.com/Yakifo/amqtt), pure Python, its own process) and checks
 
-**Two behaviours are only covered by unit tests, not by integration tests:**
-connection loss (`get_gaps`) and devices going quiet (`find_silent`). Both are hard
-to trigger on demand without a controllable broker. A built-in traffic simulator is
-the obvious fix and is planned.
+| case | positive control | must go red |
+|---|---|---|
+| auth | correct credentials connect | wrong password → not connected, error + open gap recorded |
+| `get_gaps` | no outage → no gap | broker killed and restarted → exactly one closed gap |
+| `find_silent` | both test devices arrive | the device that stopped is reported, the active one is not |
+
+Each test was checked against deliberately broken server code (outage not recorded,
+credentials not passed) and fails as it should.
+
+```bash
+uv run --group dev pytest -q tests/test_broker_e2e.py
+```
+
+Only username/password auth is covered; TLS is not.
 
 **History only covers times when the server was running.** It is a debugging tool
 started on demand, not a 24/7 collector. If something breaks while you are away and
